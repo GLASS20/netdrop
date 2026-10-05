@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 IFS=$'\n\t'
+umask 077
 
-readonly VERSION="1.0.0"
+readonly VERSION="2.0.0"
+
 readonly CONFIG_FILE="/etc/default/netdrop"
 readonly LIST_FILE="/etc/netdrop.list"
 readonly STATE_DIR="/var/lib/netdrop/state"
 readonly LOCK_FILE="/run/lock/netdrop.lock"
 
-# High priorities reserved for netdrop.
-readonly PREF_START=60000
-readonly PREF_END=65000
+readonly CONTAINER_IF_DEFAULT="eth0"
+readonly INTERVAL_DEFAULT="60"
 
-CONTAINER_IF="eth0"
-INTERVAL="60"
+# netdrop owns only this nftables priority.
+#
+# -100 is the normal DNAT priority.
+# -90 means our rules see the packet after destination NAT,
+# but before the normal filter priority 0.
+readonly NFT_PRIORITY="-90"
+
+CONTAINER_IF="$CONTAINER_IF_DEFAULT"
+INTERVAL="$INTERVAL_DEFAULT"
 
 log() {
     printf '[netdrop] %s\n' "$*" >&2
@@ -24,35 +32,50 @@ die() {
     exit 1
 }
 
-load_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$CONFIG_FILE"
-    fi
+warn() {
+    log "WARNING: $*"
+}
 
-    CONTAINER_IF="${CONTAINER_IF:-eth0}"
-    INTERVAL="${INTERVAL:-60}"
+require_root() {
+    [[ "${EUID}" -eq 0 ]] || die "this command must be run as root"
 }
 
 require_commands() {
     local cmd
+
     for cmd in "$@"; do
         command -v "$cmd" >/dev/null 2>&1 ||
             die "missing required command: $cmd"
     done
 }
 
-require_root() {
-    [[ $EUID -eq 0 ]] || die "this command must be run as root"
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+    fi
+
+    CONTAINER_IF="${CONTAINER_IF:-$CONTAINER_IF_DEFAULT}"
+    INTERVAL="${INTERVAL:-$INTERVAL_DEFAULT}"
+
+    [[ "$CONTAINER_IF" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] ||
+        die "invalid CONTAINER_IF: $CONTAINER_IF"
+
+    [[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]] ||
+        die "invalid INTERVAL: $INTERVAL"
+}
+
+ensure_dirs() {
+    install -d -m 0755 "$STATE_DIR"
+    install -d -m 0755 "$(dirname "$LOCK_FILE")"
 }
 
 validate_container_ref() {
     local ref="$1"
 
     [[ -n "$ref" ]] ||
-        die "container name/ID is empty"
+        die "container reference is empty"
 
-    # Podman names/IDs are deliberately restricted here.
     [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
         die "invalid container reference: $ref"
 }
@@ -61,8 +84,14 @@ container_full_id() {
     local ref="$1"
     local id
 
-    id="$(podman inspect -f '{{.Id}}' "$ref" 2>/dev/null)" ||
-        die "container not found: $ref"
+    if [[ "$ref" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        printf '%s\n' "${ref,,}"
+        return 0
+    fi
+
+    id="$(
+        podman inspect --type container -f '{{.Id}}' "$ref" 2>/dev/null
+    )" || die "container not found: $ref"
 
     [[ "$id" =~ ^[0-9a-f]{64}$ ]] ||
         die "Podman returned an unexpected container ID: $id"
@@ -72,37 +101,29 @@ container_full_id() {
 
 container_name() {
     local ref="$1"
-    podman inspect -f '{{.Name}}' "$ref" 2>/dev/null |
+
+    podman inspect --type container -f '{{.Name}}' "$ref" 2>/dev/null |
         sed 's#^/##'
 }
 
 container_status() {
     local ref="$1"
-    podman inspect -f '{{.State.Status}}' "$ref" 2>/dev/null
+
+    podman inspect --type container -f '{{.State.Status}}' \
+        "$ref" 2>/dev/null
 }
 
 container_pid() {
     local ref="$1"
-    podman inspect -f '{{.State.Pid}}' "$ref" 2>/dev/null
-}
 
-container_ip() {
-    local ref="$1"
-
-    podman inspect -f \
-        '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' \
-        "$ref" 2>/dev/null |
-        awk 'NF { print; exit }'
+    podman inspect --type container -f '{{.State.Pid}}' \
+        "$ref" 2>/dev/null
 }
 
 state_file_for_id() {
     local id="$1"
-    printf '%s/%s.state\n' "$STATE_DIR" "$id"
-}
 
-ensure_dirs() {
-    install -d -m 0755 "$STATE_DIR"
-    install -d -m 0755 "$(dirname "$LOCK_FILE")"
+    printf '%s/%s.state\n' "$STATE_DIR" "$id"
 }
 
 list_contains() {
@@ -112,9 +133,12 @@ list_contains() {
 
     awk -v wanted="$id" '
         $0 !~ /^[[:space:]]*#/ && NF {
-            if ($1 == wanted) found=1
+            if ($1 == wanted)
+                found=1
         }
-        END { exit(found ? 0 : 1) }
+        END {
+            exit(found ? 0 : 1)
+        }
     ' "$LIST_FILE"
 }
 
@@ -126,6 +150,8 @@ list_add() {
     if ! list_contains "$id"; then
         printf '%s\n' "$id" >> "$LIST_FILE"
     fi
+
+    chmod 0644 "$LIST_FILE"
 }
 
 list_remove() {
@@ -147,141 +173,284 @@ list_remove() {
     mv -f "$tmp" "$LIST_FILE"
 }
 
-find_veth() {
+#
+# Discover the host-side veth from:
+#
+# container PID
+#   -> container eth0 iflink
+#   -> host interface index
+#   -> host veth name
+#
+# This is intentionally NOT used as the permanent firewall binding.
+# It is recorded for diagnostics/history only.
+#
+find_host_veth() {
     local ref="$1"
     local pid
-    local ifindex
+    local iflink
     local veth
+
+    pid="$(container_pid "$ref" 2>/dev/null || true)"
+
+    [[ "$pid" =~ ^[0-9]+$ ]] ||
+        die "container is not running: $ref"
+
+    iflink="$(
+        nsenter -t "$pid" -n cat \
+            "/sys/class/net/$CONTAINER_IF/iflink" \
+            2>/dev/null
+    )" || die "cannot read $CONTAINER_IF iflink"
+
+    [[ "$iflink" =~ ^[0-9]+$ ]] ||
+        die "invalid iflink: $iflink"
+
+    veth="$(
+        ip -o link show |
+            awk -F': ' -v idx="$iflink" '$1 == idx {print $2; exit}' |
+            cut -d@ -f1
+    )"
+
+    [[ -n "$veth" ]] ||
+        die "cannot resolve host veth from ifindex $iflink"
+
+    printf '%s\n' "$veth"
+}
+
+#
+# Discover the network whose gateway is used by the container's
+# IPv4 default route.
+#
+# This avoids assuming that:
+#
+#   podman0
+#   cni-podman0
+#   10.88.0.1
+#   10.89.0.1
+#
+# is always correct.
+#
+discover_network() {
+    local ref="$1"
+    local pid
+    local rows
+    local default_gw=""
+    local fallback_name=""
+    local fallback_ip=""
+    local fallback_prefix=""
+    local fallback_gw=""
+    local fallback_ip6=""
+    local fallback_prefix6=""
+    local fallback_gw6=""
+
+    NETWORK_NAME=""
+    NETWORK_DRIVER=""
+    BRIDGE=""
+    SUBNET4=""
+    GATEWAY4=""
+    CONTAINER_IP4=""
+    SUBNET6=""
+    GATEWAY6=""
+    CONTAINER_IP6=""
 
     pid="$(container_pid "$ref")"
 
     [[ "$pid" =~ ^[0-9]+$ ]] ||
         die "container is not running: $ref"
 
-    ifindex="$(
-        nsenter -t "$pid" -n cat "/sys/class/net/$CONTAINER_IF/iflink" \
-            2>/dev/null
+    rows="$(
+        podman inspect --type container -f \
+            '{{range $name, $n := .NetworkSettings.Networks}}{{$name}}{{"\t"}}{{$n.IPAddress}}{{"\t"}}{{$n.IPPrefixLen}}{{"\t"}}{{$n.Gateway}}{{"\t"}}{{$n.GlobalIPv6Address}}{{"\t"}}{{$n.GlobalIPv6PrefixLen}}{{"\t"}}{{$n.IPv6Gateway}}{{"\n"}}{{end}}' \
+            "$ref"
     )"
 
-    [[ "$ifindex" =~ ^[0-9]+$ ]] ||
-        die "cannot determine iflink for $CONTAINER_IF"
+    [[ -n "$rows" ]] ||
+        die "container has no Podman network configuration"
 
-    veth="$(
-        ip -o link show |
-        awk -F': ' -v idx="$ifindex" '$1 == idx {print $2; exit}' |
-        cut -d@ -f1
+    default_gw="$(
+        nsenter -t "$pid" -n ip -4 route show default 2>/dev/null |
+            awk '$1 == "default" {print $3; exit}'
     )"
 
-    [[ -n "$veth" ]] ||
-        die "cannot find host veth for ifindex $ifindex"
+    while IFS=$'\t' read -r \
+        name \
+        ip4 \
+        prefix4 \
+        gw4 \
+        ip6 \
+        prefix6 \
+        gw6
+    do
+        [[ -n "$name" ]] || continue
 
-    printf '%s\n' "$veth"
-}
+        if [[ -z "$fallback_name" ]]; then
+            fallback_name="$name"
+            fallback_ip="$ip4"
+            fallback_prefix="$prefix4"
+            fallback_gw="$gw4"
+            fallback_ip6="$ip6"
+            fallback_prefix6="$prefix6"
+            fallback_gw6="$gw6"
+        fi
 
-clsact_exists() {
-    local dev="$1"
+        if [[ -n "$default_gw" && "$gw4" == "$default_gw" ]]; then
+            NETWORK_NAME="$name"
+            CONTAINER_IP4="$ip4"
+            GATEWAY4="$gw4"
+            CONTAINER_IP6="$ip6"
+            GATEWAY6="$gw6"
+            break
+        fi
+    done <<< "$rows"
 
-    tc qdisc show dev "$dev" |
-        awk '$2 == "clsact" { found=1 } END { exit(found ? 0 : 1) }'
-}
-
-ensure_clsact() {
-    local dev="$1"
-
-    if ! clsact_exists "$dev"; then
-        tc qdisc add dev "$dev" clsact
-        return 0
+    if [[ -z "$NETWORK_NAME" ]]; then
+        NETWORK_NAME="$fallback_name"
+        CONTAINER_IP4="$fallback_ip"
+        GATEWAY4="$fallback_gw"
+        CONTAINER_IP6="$fallback_ip6"
+        GATEWAY6="$fallback_gw6"
     fi
 
-    return 1
-}
+    [[ -n "$NETWORK_NAME" ]] ||
+        die "cannot determine Podman network"
 
-priority_available() {
-    local dev="$1"
-    local direction="$2"
-    local pref="$3"
+    #
+    # Current Podman/netavark:
+    #
+    #   .Driver
+    #   .NetworkInterface
+    #
+    # Older CNI configurations may expose the bridge in .plugins.
+    #
+    local network_meta
+    network_meta="$(
+        podman network inspect "$NETWORK_NAME" \
+            --format '{{.Driver}}{{"\t"}}{{.NetworkInterface}}' \
+            2>/dev/null
+    )" || die "cannot inspect Podman network: $NETWORK_NAME"
 
-    ! tc filter show dev "$dev" "$direction" 2>/dev/null |
-        grep -Eq "(^|[[:space:]])pref[[:space:]]+$pref([[:space:]]|$)"
-}
+    NETWORK_DRIVER="${network_meta%%$'\t'*}"
+    BRIDGE="${network_meta#*$'\t'}"
 
-find_free_priority() {
-    local dev="$1"
-    local direction="$2"
-    local pref
+    if [[ "$NETWORK_DRIVER" != "bridge" ]]; then
+        die "network '$NETWORK_NAME' uses driver '$NETWORK_DRIVER'; netdrop requires a Podman bridge network"
+    fi
 
-    for ((pref=PREF_START; pref<=PREF_END; pref++)); do
-        if priority_available "$dev" "$direction" "$pref"; then
-            printf '%s\n' "$pref"
-            return 0
+    if [[ "$BRIDGE" == "$network_meta" || -z "$BRIDGE" ]]; then
+        BRIDGE="$(
+            podman network inspect "$NETWORK_NAME" \
+                --format '{{range .plugins}}{{if eq .type "bridge"}}{{.bridge}}{{end}}{{end}}' \
+                2>/dev/null || true
+        )"
+    fi
+
+    [[ "$BRIDGE" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] ||
+        die "cannot determine a valid host bridge for network '$NETWORK_NAME'"
+
+    ip link show dev "$BRIDGE" >/dev/null 2>&1 ||
+        die "Podman bridge does not exist: $BRIDGE"
+
+    #
+    # Get the real subnet/gateway pair from podman network inspect.
+    #
+    local subnet_rows
+    subnet_rows="$(
+        podman network inspect "$NETWORK_NAME" \
+            --format '{{range .Subnets}}{{.Subnet}}{{"\t"}}{{.Gateway}}{{"\n"}}{{end}}' \
+            2>/dev/null
+    )" || die "cannot read subnets for network '$NETWORK_NAME'"
+
+    SUBNET4="$(
+        awk -F'\t' -v gw="$GATEWAY4" '
+            $1 ~ /^[0-9]+\./ {
+                if (gw != "" && $2 == gw) {
+                    print $1
+                    exit
+                }
+                if (fallback == "") {
+                    fallback=$1
+                }
+            }
+            END {
+                if (gw == "" && fallback != "")
+                    print fallback
+            }
+        ' <<< "$subnet_rows"
+    )"
+
+    if [[ -z "$SUBNET4" ]]; then
+        SUBNET4="$(
+            awk -F'\t' '$1 ~ /^[0-9]+\./ {print $1; exit}' \
+                <<< "$subnet_rows"
+        )"
+    fi
+
+    [[ "$CONTAINER_IP4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
+        die "container has no usable IPv4 address on network '$NETWORK_NAME'"
+
+    [[ "$SUBNET4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] ||
+        die "cannot determine IPv4 subnet for '$NETWORK_NAME'"
+
+    #
+    # IPv6 is optional. If the network/container has it, protect it too.
+    #
+    if [[ "$CONTAINER_IP6" == *:* ]]; then
+        SUBNET6="$(
+            awk -F'\t' '
+                $1 ~ /:/ {
+                    print $1
+                    exit
+                }
+            ' <<< "$subnet_rows"
+        )"
+
+        if [[ -n "$SUBNET6" && "$SUBNET6" != *:* ]]; then
+            SUBNET6=""
         fi
-    done
-
-    die "no free tc priority on $dev ($direction)"
+    fi
 }
 
-filter_exists() {
-    local dev="$1"
-    local direction="$2"
-    local pref="$3"
-    local handle="$4"
+discover_current() {
+    local ref="$1"
 
-    tc filter show dev "$dev" "$direction" 2>/dev/null |
-        grep -Eq \
-        "(^|[[:space:]])pref[[:space:]]+$pref([[:space:]]|$).*handle[[:space:]]+$handle([[:space:]]|$)"
-}
-
-add_drop_filter() {
-    local dev="$1"
-    local direction="$2"
-    local pref="$3"
-    local handle="$4"
-
-    tc filter add dev "$dev" "$direction" \
-        pref "$pref" \
-        handle "$handle" \
-        matchall \
-        action drop
-}
-
-delete_drop_filter() {
-    local dev="$1"
-    local direction="$2"
-    local pref="$3"
-    local handle="$4"
-
-    tc filter del dev "$dev" "$direction" \
-        pref "$pref" \
-        handle "$handle" \
-        2>/dev/null || true
+    HOST_VETH="$(find_host_veth "$ref")"
+    discover_network "$ref"
 }
 
 state_write() {
     local file="$1"
-    local id="$2"
-    local name="$3"
-    local ip="$4"
-    local ingress_pref="$5"
-    local ingress_handle="$6"
-    local egress_pref="$7"
-    local egress_handle="$8"
-    local created_clsact="$9"
 
     local tmp
     tmp="$(mktemp)"
 
-    cat > "$tmp" <<EOF
-VERSION=1
-CONTAINER_ID='$id'
-CONTAINER_NAME='$name'
-CONTAINER_IP='$ip'
-INGRESS_PREF='$ingress_pref'
-INGRESS_HANDLE='$ingress_handle'
-EGRESS_PREF='$egress_pref'
-EGRESS_HANDLE='$egress_handle'
-CREATED_CLSACT='$created_clsact'
-CONTAINER_IF='$CONTAINER_IF'
-EOF
+    {
+        printf 'VERSION=%q\n' "2"
+        printf 'CONTAINER_ID=%q\n' "$CONTAINER_ID"
+        printf 'CONTAINER_NAME=%q\n' "$CONTAINER_NAME"
+        printf 'CONTAINER_IF=%q\n' "$CONTAINER_IF"
+
+        printf 'HOST_VETH=%q\n' "$HOST_VETH"
+
+        printf 'NETWORK_NAME=%q\n' "$NETWORK_NAME"
+        printf 'NETWORK_DRIVER=%q\n' "$NETWORK_DRIVER"
+        printf 'BRIDGE=%q\n' "$BRIDGE"
+
+        printf 'CONTAINER_IP4=%q\n' "$CONTAINER_IP4"
+        printf 'SUBNET4=%q\n' "$SUBNET4"
+        printf 'GATEWAY4=%q\n' "$GATEWAY4"
+
+        printf 'CONTAINER_IP6=%q\n' "$CONTAINER_IP6"
+        printf 'SUBNET6=%q\n' "$SUBNET6"
+        printf 'GATEWAY6=%q\n' "$GATEWAY6"
+
+        printf 'NFT_TABLE=%q\n' "$NFT_TABLE"
+        printf 'NFT_CHAIN=%q\n' "$NFT_CHAIN"
+        printf 'NFT_PRIORITY=%q\n' "$NFT_PRIORITY"
+
+        printf 'HANDLE_OUT4=%q\n' "${HANDLE_OUT4:-}"
+        printf 'HANDLE_IN4=%q\n' "${HANDLE_IN4:-}"
+        printf 'HANDLE_OUT6=%q\n' "${HANDLE_OUT6:-}"
+        printf 'HANDLE_IN6=%q\n' "${HANDLE_IN6:-}"
+    } > "$tmp"
 
     chmod 0600 "$tmp"
     mv -f "$tmp" "$file"
@@ -293,150 +462,479 @@ state_load() {
     [[ -f "$file" ]] ||
         die "state file not found: $file"
 
+    # State files are generated by netdrop and mode 0600.
+    # No eval is used.
     # shellcheck disable=SC1090
     source "$file"
 
-    [[ "${VERSION:-}" == "1" ]] ||
+    [[ "${VERSION:-}" == "2" ]] ||
         die "unsupported state version: $file"
 }
 
-state_is_netdrop_filter() {
-    local dev="$1"
-    local direction="$2"
-    local pref="$3"
-    local handle="$4"
+nft_table_name_for_id() {
+    local id="$1"
 
-    filter_exists "$dev" "$direction" "$pref" "$handle"
+    printf 'nd_%s\n' "${id:0:16}"
 }
 
-remove_filters() {
-    local dev="$1"
-    local ingress_pref="$2"
-    local ingress_handle="$3"
-    local egress_pref="$4"
-    local egress_handle="$5"
-
-    delete_drop_filter \
-        "$dev" ingress "$ingress_pref" "$ingress_handle"
-
-    delete_drop_filter \
-        "$dev" egress "$egress_pref" "$egress_handle"
+nft_chain_name() {
+    printf 'forward\n'
 }
 
-clsact_has_filters() {
-    local dev="$1"
+nft_table_exists() {
+    local table="$1"
 
-    tc filter show dev "$dev" ingress 2>/dev/null | grep -q '[^[:space:]]' &&
-        return 0
-
-    tc filter show dev "$dev" egress 2>/dev/null | grep -q '[^[:space:]]' &&
-        return 0
-
-    return 1
+    nft list table inet "$table" >/dev/null 2>&1
 }
 
-cleanup_clsact_if_owned() {
-    local dev="$1"
-    local created="$2"
+nft_handle_for_comment() {
+    local table="$1"
+    local comment="$2"
 
-    [[ "$created" == "1" ]] || return 0
+    nft -n -a list chain inet "$table" forward 2>/dev/null |
+        awk -v c="$comment" '
+            index($0, "comment \"" c "\"") {
+                if (match($0, /# handle [0-9]+/)) {
+                    h=substr($0, RSTART+9, RLENGTH-9)
+                    print h
+                    exit
+                }
+            }
+        '
+}
 
-    if ! clsact_has_filters "$dev"; then
-        tc qdisc del dev "$dev" clsact 2>/dev/null || true
+nft_create_table() {
+    local table="$1"
+    local chain="$2"
+    local ip4="$3"
+    local subnet4="$4"
+    local bridge="$5"
+    local ip6="$6"
+    local subnet6="$7"
+
+    local tmp
+    tmp="$(mktemp)"
+
+    {
+        printf 'add table inet %s\n' "$table"
+        printf 'add chain inet %s %s { type filter hook forward priority %s; policy accept; }\n' \
+            "$table" "$chain" "$NFT_PRIORITY"
+
+        #
+        # IPv4:
+        #
+        # 1. container -> same Podman network: ACCEPT
+        # 2. another host/network -> container through bridge: ACCEPT
+        # 3. container -> anything outside Podman network: DROP
+        # 4. anything forwarded -> container: DROP
+        #
+        printf 'add rule inet %s %s iifname "%s" ip saddr %s ip daddr %s counter accept comment "netdrop:%s:out4"\n' \
+            "$table" "$chain" "$bridge" "$ip4" "$subnet4" "$CONTAINER_ID"
+
+        printf 'add rule inet %s %s oifname "%s" ip saddr %s ip daddr %s counter accept comment "netdrop:%s:in4"\n' \
+            "$table" "$chain" "$bridge" "$subnet4" "$ip4" "$CONTAINER_ID"
+
+        printf 'add rule inet %s %s iifname "%s" ip saddr %s counter drop comment "netdrop:%s:drop-out4"\n' \
+            "$table" "$chain" "$bridge" "$ip4" "$CONTAINER_ID"
+
+        printf 'add rule inet %s %s oifname "%s" ip daddr %s counter drop comment "netdrop:%s:drop-in4"\n' \
+            "$table" "$chain" "$bridge" "$ip4" "$CONTAINER_ID"
+
+        #
+        # Optional IPv6 equivalent.
+        #
+        if [[ -n "$ip6" && -n "$subnet6" ]]; then
+            printf 'add rule inet %s %s iifname "%s" ip6 saddr %s ip6 daddr %s counter accept comment "netdrop:%s:out6"\n' \
+                "$table" "$chain" "$bridge" "$ip6" "$subnet6" "$CONTAINER_ID"
+
+            printf 'add rule inet %s %s oifname "%s" ip6 saddr %s ip6 daddr %s counter accept comment "netdrop:%s:in6"\n' \
+                "$table" "$chain" "$bridge" "$subnet6" "$ip6" "$CONTAINER_ID"
+
+            printf 'add rule inet %s %s iifname "%s" ip6 saddr %s counter drop comment "netdrop:%s:drop-out6"\n' \
+                "$table" "$chain" "$bridge" "$ip6" "$CONTAINER_ID"
+
+            printf 'add rule inet %s %s oifname "%s" ip6 daddr %s counter drop comment "netdrop:%s:drop-in6"\n' \
+                "$table" "$chain" "$bridge" "$ip6" "$CONTAINER_ID"
+        fi
+    } > "$tmp"
+
+    if ! nft -f "$tmp"; then
+        rm -f "$tmp"
+        return 1
     fi
+
+    rm -f "$tmp"
+}
+
+nft_remove_table() {
+    local table="$1"
+
+    nft delete table inet "$table"
+}
+
+nft_verify_handles() {
+    local table="$1"
+
+    HANDLE_OUT4="$(nft_handle_for_comment \
+        "$table" "netdrop:${CONTAINER_ID}:out4")"
+
+    HANDLE_IN4="$(nft_handle_for_comment \
+        "$table" "netdrop:${CONTAINER_ID}:in4")"
+
+    HANDLE_OUT6=""
+    HANDLE_IN6=""
+
+    if [[ -n "${CONTAINER_IP6:-}" && -n "${SUBNET6:-}" ]]; then
+        HANDLE_OUT6="$(nft_handle_for_comment \
+            "$table" "netdrop:${CONTAINER_ID}:out6")"
+
+        HANDLE_IN6="$(nft_handle_for_comment \
+            "$table" "netdrop:${CONTAINER_ID}:in6")"
+    fi
+
+    [[ "$HANDLE_OUT4" =~ ^[0-9]+$ ]] ||
+        return 1
+
+    [[ "$HANDLE_IN4" =~ ^[0-9]+$ ]] ||
+        return 1
+
+    if [[ -n "${CONTAINER_IP6:-}" && -n "${SUBNET6:-}" ]]; then
+        [[ "$HANDLE_OUT6" =~ ^[0-9]+$ ]] ||
+            return 1
+
+        [[ "$HANDLE_IN6" =~ ^[0-9]+$ ]] ||
+            return 1
+    fi
+}
+
+nft_is_correct() {
+    local table="$1"
+
+    nft_table_exists "$table" || return 1
+
+    nft_verify_handles "$table" || return 1
+
+    return 0
+}
+
+apply_nft_rules() {
+    local old_table="$1"
+
+    #
+    # If the old table exists, build the new table only after all
+    # current Podman information has been discovered.
+    #
+    # The old table is netdrop-owned because its name is derived
+    # exclusively from the full container ID.
+    #
+    if [[ -n "$old_table" ]] && nft_table_exists "$old_table"; then
+        nft_remove_table "$old_table" ||
+            die "cannot remove stale netdrop nft table: $old_table"
+    fi
+
+    NFT_TABLE="$(nft_table_name_for_id "$CONTAINER_ID")"
+    NFT_CHAIN="$(nft_chain_name)"
+
+    nft_create_table \
+        "$NFT_TABLE" \
+        "$NFT_CHAIN" \
+        "$CONTAINER_IP4" \
+        "$SUBNET4" \
+        "$BRIDGE" \
+        "$CONTAINER_IP6" \
+        "$SUBNET6" ||
+        die "failed to install nftables rules"
+
+    if ! nft_verify_handles "$NFT_TABLE"; then
+        nft_remove_table "$NFT_TABLE" 2>/dev/null || true
+        die "nftables rules were created but could not be verified"
+    fi
+}
+
+same_configuration() {
+    [[ "${NETWORK_NAME:-}" == "$NETWORK_NAME_NEW" ]] &&
+    [[ "${NETWORK_DRIVER:-}" == "$NETWORK_DRIVER_NEW" ]] &&
+    [[ "${BRIDGE:-}" == "$BRIDGE_NEW" ]] &&
+    [[ "${CONTAINER_IP4:-}" == "$CONTAINER_IP4_NEW" ]] &&
+    [[ "${SUBNET4:-}" == "$SUBNET4_NEW" ]] &&
+    [[ "${GATEWAY4:-}" == "$GATEWAY4_NEW" ]] &&
+    [[ "${CONTAINER_IP6:-}" == "$CONTAINER_IP6_NEW" ]] &&
+    [[ "${SUBNET6:-}" == "$SUBNET6_NEW" ]] &&
+    [[ "${GATEWAY6:-}" == "$GATEWAY6_NEW" ]]
+}
+
+discover_to_new_variables() {
+    local ref="$1"
+
+    HOST_VETH_NEW="$(find_host_veth "$ref")"
+
+    local old_container_if="$CONTAINER_IF"
+
+    discover_network "$ref"
+
+    NETWORK_NAME_NEW="$NETWORK_NAME"
+    NETWORK_DRIVER_NEW="$NETWORK_DRIVER"
+    BRIDGE_NEW="$BRIDGE"
+
+    CONTAINER_IP4_NEW="$CONTAINER_IP4"
+    SUBNET4_NEW="$SUBNET4"
+    GATEWAY4_NEW="$GATEWAY4"
+
+    CONTAINER_IP6_NEW="$CONTAINER_IP6"
+    SUBNET6_NEW="$SUBNET6"
+    GATEWAY6_NEW="$GATEWAY6"
+
+    CONTAINER_IF="$old_container_if"
 }
 
 add_impl() {
     local ref="$1"
+    local id
+    local state_file
+    local status
+    local old_table=""
 
     validate_container_ref "$ref"
-
-    local id
-    local name
-    local ip
-    local status
-    local veth
-    local state_file
-    local created_clsact=0
-    local ingress_pref
-    local egress_pref
-    local ingress_handle
-    local egress_handle
 
     id="$(container_full_id "$ref")"
     state_file="$(state_file_for_id "$id")"
 
-    if [[ -f "$state_file" ]]; then
-        log "already managed: $id"
-        return 0
-    fi
-
-    status="$(container_status "$ref")"
+    status="$(container_status "$ref" 2>/dev/null || true)"
 
     [[ "$status" == "running" ]] ||
         die "container must be running: $ref (status: $status)"
 
-    name="$(container_name "$ref")"
-    ip="$(container_ip "$ref" || true)"
-    veth="$(find_veth "$ref")"
+    CONTAINER_ID="$id"
+    CONTAINER_NAME="$(container_name "$ref")"
 
-    log "container: $name"
-    log "id:        $id"
-    log "ip:        ${ip:-unknown}"
-    log "veth:      $veth"
+    discover_to_new_variables "$ref"
 
-    if ! clsact_exists "$veth"; then
-        ensure_clsact "$veth"
-        created_clsact=1
+    NFT_TABLE="$(nft_table_name_for_id "$CONTAINER_ID")"
+    NFT_CHAIN="forward"
+
+    if [[ -f "$state_file" ]]; then
+        state_load "$state_file"
+        old_table="${NFT_TABLE:-$(nft_table_name_for_id "$id")}"
+
+        #
+        # Re-discovery is authoritative. If only the veth changed,
+        # the nft rules do not need to change because they are
+        # deliberately not attached to the veth.
+        #
+        if same_configuration && nft_is_correct "$old_table"; then
+            CONTAINER_ID="$id"
+            CONTAINER_NAME="$(container_name "$ref")"
+            HOST_VETH="$HOST_VETH_NEW"
+            NETWORK_NAME="$NETWORK_NAME_NEW"
+            NETWORK_DRIVER="$NETWORK_DRIVER_NEW"
+            BRIDGE="$BRIDGE_NEW"
+            CONTAINER_IP4="$CONTAINER_IP4_NEW"
+            SUBNET4="$SUBNET4_NEW"
+            GATEWAY4="$GATEWAY4_NEW"
+            CONTAINER_IP6="$CONTAINER_IP6_NEW"
+            SUBNET6="$SUBNET6_NEW"
+            GATEWAY6="$GATEWAY6_NEW"
+            NFT_TABLE="$old_table"
+            NFT_CHAIN="forward"
+
+            nft_verify_handles "$NFT_TABLE" || true
+            state_write "$state_file"
+            list_add "$id"
+
+            log "already managed; refreshed host veth: $HOST_VETH"
+            return 0
+        fi
     fi
 
-    ingress_pref="$(find_free_priority "$veth" ingress)"
-    egress_pref="$(find_free_priority "$veth" egress)"
+    CONTAINER_ID="$id"
+    CONTAINER_NAME="$(container_name "$ref")"
 
-    # The handle namespace is deliberately separate from normal
-    # filter priorities. Keep handles unique per direction.
-    ingress_handle="$((0xD0000 + ingress_pref))"
-    egress_handle="$((0xE0000 + egress_pref))"
+    HOST_VETH="$HOST_VETH_NEW"
+    NETWORK_NAME="$NETWORK_NAME_NEW"
+    NETWORK_DRIVER="$NETWORK_DRIVER_NEW"
+    BRIDGE="$BRIDGE_NEW"
 
-    add_drop_filter \
-        "$veth" ingress "$ingress_pref" "$ingress_handle"
+    CONTAINER_IP4="$CONTAINER_IP4_NEW"
+    SUBNET4="$SUBNET4_NEW"
+    GATEWAY4="$GATEWAY4_NEW"
 
-    if ! add_drop_filter \
-        "$veth" egress "$egress_pref" "$egress_handle"; then
+    CONTAINER_IP6="$CONTAINER_IP6_NEW"
+    SUBNET6="$SUBNET6_NEW"
+    GATEWAY6="$GATEWAY6_NEW"
 
-        delete_drop_filter \
-            "$veth" ingress "$ingress_pref" "$ingress_handle"
+    NFT_TABLE="$(nft_table_name_for_id "$CONTAINER_ID")"
+    NFT_CHAIN="forward"
 
-        cleanup_clsact_if_owned "$veth" "$created_clsact"
+    log "container:   $CONTAINER_NAME"
+    log "id:          $CONTAINER_ID"
+    log "ip:          $CONTAINER_IP4"
+    log "network:     $NETWORK_NAME"
+    log "driver:      $NETWORK_DRIVER"
+    log "subnet:      $SUBNET4"
+    log "gateway:     ${GATEWAY4:-unknown}"
+    log "bridge:      $BRIDGE"
+    log "host veth:   $HOST_VETH"
 
-        die "failed to install egress drop filter"
+    #
+    # If an old netdrop table exists but the state was lost,
+    # it is still safe to replace it because the table name is
+    # derived from this exact full container ID.
+    #
+    if nft_table_exists "$NFT_TABLE"; then
+        nft_remove_table "$NFT_TABLE" ||
+            die "cannot remove stale netdrop table: $NFT_TABLE"
     fi
 
-    state_write \
-        "$state_file" \
-        "$id" \
-        "$name" \
-        "$ip" \
-        "$ingress_pref" \
-        "$ingress_handle" \
-        "$egress_pref" \
-        "$egress_handle" \
-        "$created_clsact"
+    nft_create_table \
+        "$NFT_TABLE" \
+        "$NFT_CHAIN" \
+        "$CONTAINER_IP4" \
+        "$SUBNET4" \
+        "$BRIDGE" \
+        "$CONTAINER_IP6" \
+        "$SUBNET6" ||
+        die "failed to install netdrop nftables table"
 
-    list_add "$id"
+    if ! nft_verify_handles "$NFT_TABLE"; then
+        nft_remove_table "$NFT_TABLE" 2>/dev/null || true
+        die "failed to verify netdrop nftables table"
+    fi
 
-    log "network blocked"
+    state_write "$state_file"
+    list_add "$CONTAINER_ID"
+
+    log "external network blocked"
+    log "root qdisc was not modified"
 }
 
 remove_impl() {
     local ref="$1"
+    local id
+    local state_file
+    local status=""
+    local table=""
 
     validate_container_ref "$ref"
 
+    id="$(container_full_id "$ref" 2>/dev/null || true)"
+
+    #
+    # If the container has already been deleted, a full ID is still
+    # sufficient to locate its state.
+    #
+    if [[ -z "$id" && "$ref" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        id="${ref,,}"
+    fi
+
+    [[ -n "$id" ]] ||
+        die "cannot determine container ID: $ref"
+
+    state_file="$(state_file_for_id "$id")"
+
+    [[ -f "$state_file" ]] ||
+        die "container is not managed by netdrop: $ref"
+
+    state_load "$state_file"
+
+    table="${NFT_TABLE:-$(nft_table_name_for_id "$id")}"
+
+    status="$(container_status "$ref" 2>/dev/null || true)"
+
+    #
+    # If running, rediscover current veth. This is deliberately only
+    # diagnostic because the firewall is no longer tied to veth.
+    #
+    if [[ "$status" == "running" ]]; then
+        local current_veth
+        current_veth="$(find_host_veth "$ref")"
+        log "current host veth: $current_veth"
+    else
+        log "container is not running; no current veth exists"
+    fi
+
+    if nft_table_exists "$table"; then
+        nft_remove_table "$table" ||
+            die "failed to remove netdrop nft table; state retained"
+    fi
+
+    #
+    # Verify that only our table is gone.
+    #
+    if nft_table_exists "$table"; then
+        die "netdrop nft table still exists; state retained"
+    fi
+
+    rm -f "$state_file"
+    list_remove "$id"
+
+    log "network filtering restored"
+    log "no Podman network or root qdisc was modified"
+}
+
+list_impl() {
+    printf '%-66s %-22s %-16s %-10s %-10s\n' \
+        "CONTAINER ID" "NAME" "IP" "STATUS" "NFT"
+
+    [[ -f "$LIST_FILE" ]] || return 0
+
+    local id
+
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        [[ "$id" =~ ^[0-9a-f]{64}$ ]] || continue
+
+        local name="-"
+        local ip="-"
+        local status="MISSING"
+        local nft_status="NO"
+
+        if podman inspect --type container "$id" >/dev/null 2>&1; then
+            name="$(container_name "$id")"
+            ip="$(
+                podman inspect --type container -f \
+                    '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' \
+                    "$id" 2>/dev/null |
+                    awk 'NF {print; exit}' || true
+            )"
+
+            status="$(container_status "$id")"
+
+            if [[ "$status" == "running" ]]; then
+                status="RUNNING"
+            fi
+
+            local state_file
+            state_file="$(state_file_for_id "$id")"
+
+            if [[ -f "$state_file" ]]; then
+                local saved_table
+                saved_table="$(
+                    sed -n 's/^NFT_TABLE=//p' "$state_file" |
+                        sed "s/^'//; s/'$//" || true
+                )
+
+                if [[ -n "$saved_table" ]] &&
+                    nft_table_exists "$saved_table"; then
+                    nft_status="YES"
+                fi
+            fi
+        fi
+
+        printf '%-66s %-22s %-16s %-10s %-10s\n' \
+            "$id" \
+            "${name:0:22}" \
+            "${ip:--}" \
+            "$status" \
+            "$nft_status"
+    done < "$LIST_FILE"
+}
+
+show_impl() {
+    local ref="$1"
     local id
     local state_file
-    local status
-    local veth
+
+    validate_container_ref "$ref"
 
     id="$(container_full_id "$ref")"
     state_file="$(state_file_for_id "$id")"
@@ -446,123 +944,44 @@ remove_impl() {
 
     state_load "$state_file"
 
-    status="$(container_status "$ref" 2>/dev/null || true)"
+    printf 'container_id:       %s\n' "$CONTAINER_ID"
+    printf 'container_name:     %s\n' "$CONTAINER_NAME"
+    printf 'container_if:       %s\n' "$CONTAINER_IF"
+    printf 'container_ip4:      %s\n' "$CONTAINER_IP4"
+    printf 'container_ip6:      %s\n' "${CONTAINER_IP6:--}"
+    printf 'network:             %s\n' "$NETWORK_NAME"
+    printf 'driver:              %s\n' "$NETWORK_DRIVER"
+    printf 'bridge:              %s\n' "$BRIDGE"
+    printf 'subnet4:             %s\n' "$SUBNET4"
+    printf 'gateway4:            %s\n' "${GATEWAY4:--}"
+    printf 'subnet6:             %s\n' "${SUBNET6:--}"
+    printf 'gateway6:            %s\n' "${GATEWAY6:--}"
+    printf 'current/old veth:    %s\n' "${HOST_VETH:--}"
+    printf 'nft table:           %s\n' "$NFT_TABLE"
+    printf 'nft chain:           %s\n' "$NFT_CHAIN"
+    printf 'nft priority:        %s\n' "$NFT_PRIORITY"
+    printf 'handle out4:         %s\n' "${HANDLE_OUT4:--}"
+    printf 'handle in4:          %s\n' "${HANDLE_IN4:--}"
+    printf 'handle out6:         %s\n' "${HANDLE_OUT6:--}"
+    printf 'handle in6:          %s\n' "${HANDLE_IN6:--}"
 
-    if [[ "$status" != "running" ]]; then
-        log "container is not running; removing saved state only"
-        rm -f "$state_file"
-        list_remove "$id"
-        return 0
+    printf '\nCurrent nftables table:\n'
+
+    if nft_table_exists "$NFT_TABLE"; then
+        nft -n -a list table inet "$NFT_TABLE"
+    else
+        printf '%s\n' "NOT PRESENT"
     fi
-
-    veth="$(find_veth "$ref")"
-
-    log "restoring network: $veth"
-
-    remove_filters \
-        "$veth" \
-        "$INGRESS_PREF" \
-        "$INGRESS_HANDLE" \
-        "$EGRESS_PREF" \
-        "$EGRESS_HANDLE"
-
-    # Verify that our filters are actually gone.
-    if state_is_netdrop_filter \
-        "$veth" ingress "$INGRESS_PREF" "$INGRESS_HANDLE"; then
-        die "failed to remove ingress netdrop filter; state retained"
-    fi
-
-    if state_is_netdrop_filter \
-        "$veth" egress "$EGRESS_PREF" "$EGRESS_HANDLE"; then
-        die "failed to remove egress netdrop filter; state retained"
-    fi
-
-    cleanup_clsact_if_owned "$veth" "$CREATED_CLSACT"
-
-    rm -f "$state_file"
-    list_remove "$id"
-
-    log "network restored"
 }
 
-list_impl() {
-    printf '%-66s %-20s %-16s %-10s\n' \
-        "CONTAINER ID" "NAME" "IP" "STATUS"
-
-    [[ -f "$LIST_FILE" ]] || return 0
-
-    while read -r id; do
-        [[ -n "$id" ]] || continue
-        [[ "$id" =~ ^[0-9a-f]{64}$ ]] || continue
-
-        local name="?"
-        local ip="-"
-        local status="MISSING"
-
-        if podman inspect "$id" >/dev/null 2>&1; then
-            name="$(container_name "$id")"
-            ip="$(container_ip "$id" || true)"
-            status="STOPPED"
-
-            if [[ "$(container_status "$id")" == "running" ]]; then
-                status="DROPPED"
-            fi
-        fi
-
-        printf '%-66s %-20s %-16s %-10s\n' \
-            "$id" \
-            "${name:0:20}" \
-            "${ip:--}" \
-            "$status"
-    done < "$LIST_FILE"
-}
-
-show_impl() {
-    local ref="$1"
-
-    validate_container_ref "$ref"
-
-    local id
-    local state_file
-
-    id="$(container_full_id "$ref")"
-    state_file="$(state_file_for_id "$id")"
-
-    if [[ ! -f "$state_file" ]]; then
-        die "container is not managed by netdrop: $ref"
-    fi
-
-    state_load "$state_file"
-
-    local status
-    status="$(container_status "$ref" 2>/dev/null || echo missing)"
-
-    printf 'container_id:    %s\n' "$CONTAINER_ID"
-    printf 'container_name:  %s\n' "$CONTAINER_NAME"
-    printf 'container_ip:    %s\n' "${CONTAINER_IP:-unknown}"
-    printf 'status:          %s\n' "$status"
-    printf 'container_if:    %s\n' "$CONTAINER_IF"
-    printf 'ingress_pref:    %s\n' "$INGRESS_PREF"
-    printf 'ingress_handle:  %s\n' "$INGRESS_HANDLE"
-    printf 'egress_pref:     %s\n' "$EGRESS_PREF"
-    printf 'egress_handle:   %s\n' "$EGRESS_HANDLE"
-    printf 'created_clsact:  %s\n' "$CREATED_CLSACT"
-
-    if [[ "$status" == "running" ]]; then
-        local veth
-        veth="$(find_veth "$ref")"
-
-        printf 'host_veth:       %s\n' "$veth"
-        printf '\nIngress filter:\n'
-        tc filter show dev "$veth" ingress || true
-        printf '\nEgress filter:\n'
-        tc filter show dev "$veth" egress || true
-    fi
+status_impl() {
+    show_impl "$1"
 }
 
 check_one() {
     local id="$1"
     local state_file
+
     state_file="$(state_file_for_id "$id")"
 
     if [[ ! -f "$state_file" ]]; then
@@ -572,54 +991,130 @@ check_one() {
 
     state_load "$state_file"
 
-    if ! podman inspect "$id" >/dev/null 2>&1; then
+    if ! podman inspect --type container "$id" >/dev/null 2>&1; then
         log "container missing: $id"
+        #
+        # Do not silently remove state. The user may want to inspect
+        # or manually clean it, and the nft table can still be removed
+        # with "netdrop remove <full-id>".
         return 1
     fi
 
-    if [[ "$(container_status "$id")" != "running" ]]; then
-        log "container stopped: $id"
+    local status
+    status="$(container_status "$id")"
+
+    if [[ "$status" != "running" ]]; then
+        log "container stopped; preserving state: $id"
         return 0
     fi
 
-    local veth
-    veth="$(find_veth "$id")"
+    CONTAINER_ID="$id"
 
-    # A container restart can create a new host veth.
-    # Reinstall our filters if the new veth does not have them.
-    if ! state_is_netdrop_filter \
-        "$veth" ingress "$INGRESS_PREF" "$INGRESS_HANDLE" ||
-       ! state_is_netdrop_filter \
-        "$veth" egress "$EGRESS_PREF" "$EGRESS_HANDLE"; then
+    #
+    # Re-discover veth on every check. It is intentionally not a
+    # permanent binding.
+    #
+    local current_veth
+    current_veth="$(find_host_veth "$id")"
 
-        log "re-applying drop filters: $id"
+    #
+    # Discover current Podman network state.
+    #
+    discover_to_new_variables "$id"
 
-        if ! clsact_exists "$veth"; then
-            tc qdisc add dev "$veth" clsact
-        fi
+    NFT_TABLE="$(nft_table_name_for_id "$id")"
+    NFT_CHAIN="forward"
 
-        if ! state_is_netdrop_filter \
-            "$veth" ingress "$INGRESS_PREF" "$INGRESS_HANDLE"; then
-            add_drop_filter \
-                "$veth" ingress "$INGRESS_PREF" "$INGRESS_HANDLE"
-        fi
+    local need_rebuild=0
 
-        if ! state_is_netdrop_filter \
-            "$veth" egress "$EGRESS_PREF" "$EGRESS_HANDLE"; then
-            add_drop_filter \
-                "$veth" egress "$EGRESS_PREF" "$EGRESS_HANDLE"
-        fi
+    if ! nft_table_exists "$NFT_TABLE"; then
+        need_rebuild=1
+        log "netdrop nft table missing: $id"
+    elif ! same_configuration; then
+        need_rebuild=1
+        log "Podman network configuration changed: $id"
     fi
+
+    if [[ "$need_rebuild" -eq 1 ]]; then
+        #
+        # Populate the authoritative current values.
+        #
+        CONTAINER_NAME="$(container_name "$id")"
+        HOST_VETH="$current_veth"
+
+        NETWORK_NAME="$NETWORK_NAME_NEW"
+        NETWORK_DRIVER="$NETWORK_DRIVER_NEW"
+        BRIDGE="$BRIDGE_NEW"
+
+        CONTAINER_IP4="$CONTAINER_IP4_NEW"
+        SUBNET4="$SUBNET4_NEW"
+        GATEWAY4="$GATEWAY4_NEW"
+
+        CONTAINER_IP6="$CONTAINER_IP6_NEW"
+        SUBNET6="$SUBNET6_NEW"
+        GATEWAY6="$GATEWAY6_NEW"
+
+        if nft_table_exists "$NFT_TABLE"; then
+            nft_remove_table "$NFT_TABLE" ||
+                die "cannot remove stale nft table during check"
+        fi
+
+        nft_create_table \
+            "$NFT_TABLE" \
+            "$NFT_CHAIN" \
+            "$CONTAINER_IP4" \
+            "$SUBNET4" \
+            "$BRIDGE" \
+            "$CONTAINER_IP6" \
+            "$SUBNET6"
+
+        nft_verify_handles "$NFT_TABLE" ||
+            die "new nft table failed verification"
+
+        state_write "$state_file"
+
+        log "re-applied netdrop rules: $id"
+    else
+        #
+        # The veth may have changed while nft filtering remains valid.
+        # Update only the historical/debug veth in state.
+        #
+        CONTAINER_NAME="$(container_name "$id")"
+        HOST_VETH="$current_veth"
+
+        NETWORK_NAME="$NETWORK_NAME_NEW"
+        NETWORK_DRIVER="$NETWORK_DRIVER_NEW"
+        BRIDGE="$BRIDGE_NEW"
+
+        CONTAINER_IP4="$CONTAINER_IP4_NEW"
+        SUBNET4="$SUBNET4_NEW"
+        GATEWAY4="$GATEWAY4_NEW"
+
+        CONTAINER_IP6="$CONTAINER_IP6_NEW"
+        SUBNET6="$SUBNET6_NEW"
+        GATEWAY6="$GATEWAY6_NEW"
+
+        nft_verify_handles "$NFT_TABLE" ||
+            die "existing netdrop nft table failed verification"
+
+        state_write "$state_file"
+    fi
+
+    list_add "$id"
 }
 
 check_impl() {
     [[ -f "$LIST_FILE" ]] || return 0
 
     local id
+
     while read -r id; do
         [[ -n "$id" ]] || continue
         [[ "$id" =~ ^[0-9a-f]{64}$ ]] || continue
 
+        #
+        # A broken container must never terminate the daemon.
+        #
         if ! check_one "$id"; then
             log "check failed: $id"
         fi
@@ -632,6 +1127,7 @@ with_lock() {
     flock -x 9
 
     local rc
+
     if "$@"; then
         rc=0
     else
@@ -663,17 +1159,26 @@ Usage:
   netdrop list
   netdrop check
   netdrop show <container>
+  netdrop status <container>
   netdrop daemon
   netdrop version
 
 Commands:
-  add       Block ingress and egress traffic.
-  remove    Remove only netdrop's filters.
-  list      Show managed containers.
-  check     Verify/reapply filters.
-  show      Show state and tc filters.
-  daemon    Run the periodic checker.
+  add       Block external routed traffic for a Podman bridge container.
+  remove    Remove only netdrop-owned nftables state.
+  list      List managed containers.
+  check     Verify/reapply rules.
+  show      Show saved state and nftables rules.
+  status    Alias for show.
+  daemon    Run periodic checks.
   version   Show version.
+
+Design:
+  - Does NOT replace/delete/flush any tc root qdisc.
+  - Does NOT install tc matchall drops.
+  - Uses a dedicated nftables inet/forward table per container.
+  - Dynamically discovers Podman network, bridge, subnet and gateway.
+  - Dynamically discovers the host veth from container eth0/iflink.
 EOF
 }
 
@@ -687,8 +1192,11 @@ main() {
                 usage
                 exit 2
             }
+
             require_root
-            require_commands podman tc ip nsenter flock awk grep sed cut mktemp
+            require_commands \
+                podman nft ip nsenter flock awk grep sed cut mktemp
+
             with_lock add_impl "$2"
             ;;
 
@@ -697,8 +1205,11 @@ main() {
                 usage
                 exit 2
             }
+
             require_root
-            require_commands podman tc ip nsenter flock awk grep sed cut mktemp
+            require_commands \
+                podman nft ip nsenter flock awk grep sed cut mktemp
+
             with_lock remove_impl "$2"
             ;;
 
@@ -707,8 +1218,11 @@ main() {
                 usage
                 exit 2
             }
+
             require_root
-            require_commands podman flock awk grep sed
+            require_commands \
+                podman nft flock awk grep sed
+
             with_lock list_impl
             ;;
 
@@ -717,8 +1231,11 @@ main() {
                 usage
                 exit 2
             }
+
             require_root
-            require_commands podman tc ip nsenter flock awk grep sed cut
+            require_commands \
+                podman nft ip nsenter flock awk grep sed cut mktemp
+
             with_lock check_impl
             ;;
 
@@ -727,9 +1244,25 @@ main() {
                 usage
                 exit 2
             }
+
             require_root
-            require_commands podman tc ip nsenter flock awk grep sed cut
+            require_commands \
+                podman nft ip nsenter flock awk grep sed cut
+
             with_lock show_impl "$2"
+            ;;
+
+        status)
+            [[ $# -eq 2 ]] || {
+                usage
+                exit 2
+            }
+
+            require_root
+            require_commands \
+                podman nft ip nsenter flock awk grep sed cut
+
+            with_lock status_impl "$2"
             ;;
 
         daemon)
@@ -737,12 +1270,20 @@ main() {
                 usage
                 exit 2
             }
+
             require_root
-            require_commands podman tc ip nsenter flock awk grep sed cut
+            require_commands \
+                podman nft ip nsenter flock awk grep sed cut mktemp
+
             daemon_impl
             ;;
 
         version)
+            [[ $# -eq 1 ]] || {
+                usage
+                exit 2
+            }
+
             printf '%s\n' "$VERSION"
             ;;
 
