@@ -1,0 +1,756 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly VERSION="1.0.0"
+readonly CONFIG_FILE="/etc/default/netdrop"
+readonly LIST_FILE="/etc/netdrop.list"
+readonly STATE_DIR="/var/lib/netdrop/state"
+readonly LOCK_FILE="/run/lock/netdrop.lock"
+
+# High priorities reserved for netdrop.
+readonly PREF_START=60000
+readonly PREF_END=65000
+
+CONTAINER_IF="eth0"
+INTERVAL="60"
+
+log() {
+    printf '[netdrop] %s\n' "$*" >&2
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+    fi
+
+    CONTAINER_IF="${CONTAINER_IF:-eth0}"
+    INTERVAL="${INTERVAL:-60}"
+}
+
+require_commands() {
+    local cmd
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 ||
+            die "missing required command: $cmd"
+    done
+}
+
+require_root() {
+    [[ $EUID -eq 0 ]] || die "this command must be run as root"
+}
+
+validate_container_ref() {
+    local ref="$1"
+
+    [[ -n "$ref" ]] ||
+        die "container name/ID is empty"
+
+    # Podman names/IDs are deliberately restricted here.
+    [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+        die "invalid container reference: $ref"
+}
+
+container_full_id() {
+    local ref="$1"
+    local id
+
+    id="$(podman inspect -f '{{.Id}}' "$ref" 2>/dev/null)" ||
+        die "container not found: $ref"
+
+    [[ "$id" =~ ^[0-9a-f]{64}$ ]] ||
+        die "Podman returned an unexpected container ID: $id"
+
+    printf '%s\n' "$id"
+}
+
+container_name() {
+    local ref="$1"
+    podman inspect -f '{{.Name}}' "$ref" 2>/dev/null |
+        sed 's#^/##'
+}
+
+container_status() {
+    local ref="$1"
+    podman inspect -f '{{.State.Status}}' "$ref" 2>/dev/null
+}
+
+container_pid() {
+    local ref="$1"
+    podman inspect -f '{{.State.Pid}}' "$ref" 2>/dev/null
+}
+
+container_ip() {
+    local ref="$1"
+
+    podman inspect -f \
+        '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' \
+        "$ref" 2>/dev/null |
+        awk 'NF { print; exit }'
+}
+
+state_file_for_id() {
+    local id="$1"
+    printf '%s/%s.state\n' "$STATE_DIR" "$id"
+}
+
+ensure_dirs() {
+    install -d -m 0755 "$STATE_DIR"
+    install -d -m 0755 "$(dirname "$LOCK_FILE")"
+}
+
+list_contains() {
+    local id="$1"
+
+    [[ -f "$LIST_FILE" ]] || return 1
+
+    awk -v wanted="$id" '
+        $0 !~ /^[[:space:]]*#/ && NF {
+            if ($1 == wanted) found=1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$LIST_FILE"
+}
+
+list_add() {
+    local id="$1"
+
+    touch "$LIST_FILE"
+
+    if ! list_contains "$id"; then
+        printf '%s\n' "$id" >> "$LIST_FILE"
+    fi
+}
+
+list_remove() {
+    local id="$1"
+    local tmp
+
+    [[ -f "$LIST_FILE" ]] || return 0
+
+    tmp="$(mktemp)"
+
+    awk -v wanted="$id" '
+        $0 !~ /^[[:space:]]*#/ && $1 == wanted {
+            next
+        }
+        { print }
+    ' "$LIST_FILE" > "$tmp"
+
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$LIST_FILE"
+}
+
+find_veth() {
+    local ref="$1"
+    local pid
+    local ifindex
+    local veth
+
+    pid="$(container_pid "$ref")"
+
+    [[ "$pid" =~ ^[0-9]+$ ]] ||
+        die "container is not running: $ref"
+
+    ifindex="$(
+        nsenter -t "$pid" -n cat "/sys/class/net/$CONTAINER_IF/iflink" \
+            2>/dev/null
+    )"
+
+    [[ "$ifindex" =~ ^[0-9]+$ ]] ||
+        die "cannot determine iflink for $CONTAINER_IF"
+
+    veth="$(
+        ip -o link show |
+        awk -F': ' -v idx="$ifindex" '$1 == idx {print $2; exit}' |
+        cut -d@ -f1
+    )"
+
+    [[ -n "$veth" ]] ||
+        die "cannot find host veth for ifindex $ifindex"
+
+    printf '%s\n' "$veth"
+}
+
+clsact_exists() {
+    local dev="$1"
+
+    tc qdisc show dev "$dev" |
+        awk '$2 == "clsact" { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+ensure_clsact() {
+    local dev="$1"
+
+    if ! clsact_exists "$dev"; then
+        tc qdisc add dev "$dev" clsact
+        return 0
+    fi
+
+    return 1
+}
+
+priority_available() {
+    local dev="$1"
+    local direction="$2"
+    local pref="$3"
+
+    ! tc filter show dev "$dev" "$direction" 2>/dev/null |
+        grep -Eq "(^|[[:space:]])pref[[:space:]]+$pref([[:space:]]|$)"
+}
+
+find_free_priority() {
+    local dev="$1"
+    local direction="$2"
+    local pref
+
+    for ((pref=PREF_START; pref<=PREF_END; pref++)); do
+        if priority_available "$dev" "$direction" "$pref"; then
+            printf '%s\n' "$pref"
+            return 0
+        fi
+    done
+
+    die "no free tc priority on $dev ($direction)"
+}
+
+filter_exists() {
+    local dev="$1"
+    local direction="$2"
+    local pref="$3"
+    local handle="$4"
+
+    tc filter show dev "$dev" "$direction" 2>/dev/null |
+        grep -Eq \
+        "(^|[[:space:]])pref[[:space:]]+$pref([[:space:]]|$).*handle[[:space:]]+$handle([[:space:]]|$)"
+}
+
+add_drop_filter() {
+    local dev="$1"
+    local direction="$2"
+    local pref="$3"
+    local handle="$4"
+
+    tc filter add dev "$dev" "$direction" \
+        pref "$pref" \
+        handle "$handle" \
+        matchall \
+        action drop
+}
+
+delete_drop_filter() {
+    local dev="$1"
+    local direction="$2"
+    local pref="$3"
+    local handle="$4"
+
+    tc filter del dev "$dev" "$direction" \
+        pref "$pref" \
+        handle "$handle" \
+        2>/dev/null || true
+}
+
+state_write() {
+    local file="$1"
+    local id="$2"
+    local name="$3"
+    local ip="$4"
+    local ingress_pref="$5"
+    local ingress_handle="$6"
+    local egress_pref="$7"
+    local egress_handle="$8"
+    local created_clsact="$9"
+
+    local tmp
+    tmp="$(mktemp)"
+
+    cat > "$tmp" <<EOF
+VERSION=1
+CONTAINER_ID='$id'
+CONTAINER_NAME='$name'
+CONTAINER_IP='$ip'
+INGRESS_PREF='$ingress_pref'
+INGRESS_HANDLE='$ingress_handle'
+EGRESS_PREF='$egress_pref'
+EGRESS_HANDLE='$egress_handle'
+CREATED_CLSACT='$created_clsact'
+CONTAINER_IF='$CONTAINER_IF'
+EOF
+
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$file"
+}
+
+state_load() {
+    local file="$1"
+
+    [[ -f "$file" ]] ||
+        die "state file not found: $file"
+
+    # shellcheck disable=SC1090
+    source "$file"
+
+    [[ "${VERSION:-}" == "1" ]] ||
+        die "unsupported state version: $file"
+}
+
+state_is_netdrop_filter() {
+    local dev="$1"
+    local direction="$2"
+    local pref="$3"
+    local handle="$4"
+
+    filter_exists "$dev" "$direction" "$pref" "$handle"
+}
+
+remove_filters() {
+    local dev="$1"
+    local ingress_pref="$2"
+    local ingress_handle="$3"
+    local egress_pref="$4"
+    local egress_handle="$5"
+
+    delete_drop_filter \
+        "$dev" ingress "$ingress_pref" "$ingress_handle"
+
+    delete_drop_filter \
+        "$dev" egress "$egress_pref" "$egress_handle"
+}
+
+clsact_has_filters() {
+    local dev="$1"
+
+    tc filter show dev "$dev" ingress 2>/dev/null | grep -q '[^[:space:]]' &&
+        return 0
+
+    tc filter show dev "$dev" egress 2>/dev/null | grep -q '[^[:space:]]' &&
+        return 0
+
+    return 1
+}
+
+cleanup_clsact_if_owned() {
+    local dev="$1"
+    local created="$2"
+
+    [[ "$created" == "1" ]] || return 0
+
+    if ! clsact_has_filters "$dev"; then
+        tc qdisc del dev "$dev" clsact 2>/dev/null || true
+    fi
+}
+
+add_impl() {
+    local ref="$1"
+
+    validate_container_ref "$ref"
+
+    local id
+    local name
+    local ip
+    local status
+    local veth
+    local state_file
+    local created_clsact=0
+    local ingress_pref
+    local egress_pref
+    local ingress_handle
+    local egress_handle
+
+    id="$(container_full_id "$ref")"
+    state_file="$(state_file_for_id "$id")"
+
+    if [[ -f "$state_file" ]]; then
+        log "already managed: $id"
+        return 0
+    fi
+
+    status="$(container_status "$ref")"
+
+    [[ "$status" == "running" ]] ||
+        die "container must be running: $ref (status: $status)"
+
+    name="$(container_name "$ref")"
+    ip="$(container_ip "$ref" || true)"
+    veth="$(find_veth "$ref")"
+
+    log "container: $name"
+    log "id:        $id"
+    log "ip:        ${ip:-unknown}"
+    log "veth:      $veth"
+
+    if ! clsact_exists "$veth"; then
+        ensure_clsact "$veth"
+        created_clsact=1
+    fi
+
+    ingress_pref="$(find_free_priority "$veth" ingress)"
+    egress_pref="$(find_free_priority "$veth" egress)"
+
+    # The handle namespace is deliberately separate from normal
+    # filter priorities. Keep handles unique per direction.
+    ingress_handle="$((0xD0000 + ingress_pref))"
+    egress_handle="$((0xE0000 + egress_pref))"
+
+    add_drop_filter \
+        "$veth" ingress "$ingress_pref" "$ingress_handle"
+
+    if ! add_drop_filter \
+        "$veth" egress "$egress_pref" "$egress_handle"; then
+
+        delete_drop_filter \
+            "$veth" ingress "$ingress_pref" "$ingress_handle"
+
+        cleanup_clsact_if_owned "$veth" "$created_clsact"
+
+        die "failed to install egress drop filter"
+    fi
+
+    state_write \
+        "$state_file" \
+        "$id" \
+        "$name" \
+        "$ip" \
+        "$ingress_pref" \
+        "$ingress_handle" \
+        "$egress_pref" \
+        "$egress_handle" \
+        "$created_clsact"
+
+    list_add "$id"
+
+    log "network blocked"
+}
+
+remove_impl() {
+    local ref="$1"
+
+    validate_container_ref "$ref"
+
+    local id
+    local state_file
+    local status
+    local veth
+
+    id="$(container_full_id "$ref")"
+    state_file="$(state_file_for_id "$id")"
+
+    [[ -f "$state_file" ]] ||
+        die "container is not managed by netdrop: $ref"
+
+    state_load "$state_file"
+
+    status="$(container_status "$ref" 2>/dev/null || true)"
+
+    if [[ "$status" != "running" ]]; then
+        log "container is not running; removing saved state only"
+        rm -f "$state_file"
+        list_remove "$id"
+        return 0
+    fi
+
+    veth="$(find_veth "$ref")"
+
+    log "restoring network: $veth"
+
+    remove_filters \
+        "$veth" \
+        "$INGRESS_PREF" \
+        "$INGRESS_HANDLE" \
+        "$EGRESS_PREF" \
+        "$EGRESS_HANDLE"
+
+    # Verify that our filters are actually gone.
+    if state_is_netdrop_filter \
+        "$veth" ingress "$INGRESS_PREF" "$INGRESS_HANDLE"; then
+        die "failed to remove ingress netdrop filter; state retained"
+    fi
+
+    if state_is_netdrop_filter \
+        "$veth" egress "$EGRESS_PREF" "$EGRESS_HANDLE"; then
+        die "failed to remove egress netdrop filter; state retained"
+    fi
+
+    cleanup_clsact_if_owned "$veth" "$CREATED_CLSACT"
+
+    rm -f "$state_file"
+    list_remove "$id"
+
+    log "network restored"
+}
+
+list_impl() {
+    printf '%-66s %-20s %-16s %-10s\n' \
+        "CONTAINER ID" "NAME" "IP" "STATUS"
+
+    [[ -f "$LIST_FILE" ]] || return 0
+
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        [[ "$id" =~ ^[0-9a-f]{64}$ ]] || continue
+
+        local name="?"
+        local ip="-"
+        local status="MISSING"
+
+        if podman inspect "$id" >/dev/null 2>&1; then
+            name="$(container_name "$id")"
+            ip="$(container_ip "$id" || true)"
+            status="STOPPED"
+
+            if [[ "$(container_status "$id")" == "running" ]]; then
+                status="DROPPED"
+            fi
+        fi
+
+        printf '%-66s %-20s %-16s %-10s\n' \
+            "$id" \
+            "${name:0:20}" \
+            "${ip:--}" \
+            "$status"
+    done < "$LIST_FILE"
+}
+
+show_impl() {
+    local ref="$1"
+
+    validate_container_ref "$ref"
+
+    local id
+    local state_file
+
+    id="$(container_full_id "$ref")"
+    state_file="$(state_file_for_id "$id")"
+
+    if [[ ! -f "$state_file" ]]; then
+        die "container is not managed by netdrop: $ref"
+    fi
+
+    state_load "$state_file"
+
+    local status
+    status="$(container_status "$ref" 2>/dev/null || echo missing)"
+
+    printf 'container_id:    %s\n' "$CONTAINER_ID"
+    printf 'container_name:  %s\n' "$CONTAINER_NAME"
+    printf 'container_ip:    %s\n' "${CONTAINER_IP:-unknown}"
+    printf 'status:          %s\n' "$status"
+    printf 'container_if:    %s\n' "$CONTAINER_IF"
+    printf 'ingress_pref:    %s\n' "$INGRESS_PREF"
+    printf 'ingress_handle:  %s\n' "$INGRESS_HANDLE"
+    printf 'egress_pref:     %s\n' "$EGRESS_PREF"
+    printf 'egress_handle:   %s\n' "$EGRESS_HANDLE"
+    printf 'created_clsact:  %s\n' "$CREATED_CLSACT"
+
+    if [[ "$status" == "running" ]]; then
+        local veth
+        veth="$(find_veth "$ref")"
+
+        printf 'host_veth:       %s\n' "$veth"
+        printf '\nIngress filter:\n'
+        tc filter show dev "$veth" ingress || true
+        printf '\nEgress filter:\n'
+        tc filter show dev "$veth" egress || true
+    fi
+}
+
+check_one() {
+    local id="$1"
+    local state_file
+    state_file="$(state_file_for_id "$id")"
+
+    if [[ ! -f "$state_file" ]]; then
+        log "missing state: $id"
+        return 1
+    fi
+
+    state_load "$state_file"
+
+    if ! podman inspect "$id" >/dev/null 2>&1; then
+        log "container missing: $id"
+        return 1
+    fi
+
+    if [[ "$(container_status "$id")" != "running" ]]; then
+        log "container stopped: $id"
+        return 0
+    fi
+
+    local veth
+    veth="$(find_veth "$id")"
+
+    # A container restart can create a new host veth.
+    # Reinstall our filters if the new veth does not have them.
+    if ! state_is_netdrop_filter \
+        "$veth" ingress "$INGRESS_PREF" "$INGRESS_HANDLE" ||
+       ! state_is_netdrop_filter \
+        "$veth" egress "$EGRESS_PREF" "$EGRESS_HANDLE"; then
+
+        log "re-applying drop filters: $id"
+
+        if ! clsact_exists "$veth"; then
+            tc qdisc add dev "$veth" clsact
+        fi
+
+        if ! state_is_netdrop_filter \
+            "$veth" ingress "$INGRESS_PREF" "$INGRESS_HANDLE"; then
+            add_drop_filter \
+                "$veth" ingress "$INGRESS_PREF" "$INGRESS_HANDLE"
+        fi
+
+        if ! state_is_netdrop_filter \
+            "$veth" egress "$EGRESS_PREF" "$EGRESS_HANDLE"; then
+            add_drop_filter \
+                "$veth" egress "$EGRESS_PREF" "$EGRESS_HANDLE"
+        fi
+    fi
+}
+
+check_impl() {
+    [[ -f "$LIST_FILE" ]] || return 0
+
+    local id
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        [[ "$id" =~ ^[0-9a-f]{64}$ ]] || continue
+
+        if ! check_one "$id"; then
+            log "check failed: $id"
+        fi
+    done < "$LIST_FILE"
+}
+
+with_lock() {
+    exec 9>"$LOCK_FILE"
+
+    flock -x 9
+
+    local rc
+    if "$@"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    flock -u 9
+    exec 9>&-
+
+    return "$rc"
+}
+
+daemon_impl() {
+    log "daemon started; interval=${INTERVAL}s"
+
+    while true; do
+        with_lock check_impl || true
+        sleep "$INTERVAL"
+    done
+}
+
+usage() {
+    cat <<EOF
+netdrop $VERSION
+
+Usage:
+  netdrop add <container>
+  netdrop remove <container>
+  netdrop list
+  netdrop check
+  netdrop show <container>
+  netdrop daemon
+  netdrop version
+
+Commands:
+  add       Block ingress and egress traffic.
+  remove    Remove only netdrop's filters.
+  list      Show managed containers.
+  check     Verify/reapply filters.
+  show      Show state and tc filters.
+  daemon    Run the periodic checker.
+  version   Show version.
+EOF
+}
+
+main() {
+    load_config
+    ensure_dirs
+
+    case "${1:-}" in
+        add)
+            [[ $# -eq 2 ]] || {
+                usage
+                exit 2
+            }
+            require_root
+            require_commands podman tc ip nsenter flock awk grep sed cut mktemp
+            with_lock add_impl "$2"
+            ;;
+
+        remove)
+            [[ $# -eq 2 ]] || {
+                usage
+                exit 2
+            }
+            require_root
+            require_commands podman tc ip nsenter flock awk grep sed cut mktemp
+            with_lock remove_impl "$2"
+            ;;
+
+        list)
+            [[ $# -eq 1 ]] || {
+                usage
+                exit 2
+            }
+            require_root
+            require_commands podman flock awk grep sed
+            with_lock list_impl
+            ;;
+
+        check)
+            [[ $# -eq 1 ]] || {
+                usage
+                exit 2
+            }
+            require_root
+            require_commands podman tc ip nsenter flock awk grep sed cut
+            with_lock check_impl
+            ;;
+
+        show)
+            [[ $# -eq 2 ]] || {
+                usage
+                exit 2
+            }
+            require_root
+            require_commands podman tc ip nsenter flock awk grep sed cut
+            with_lock show_impl "$2"
+            ;;
+
+        daemon)
+            [[ $# -eq 1 ]] || {
+                usage
+                exit 2
+            }
+            require_root
+            require_commands podman tc ip nsenter flock awk grep sed cut
+            daemon_impl
+            ;;
+
+        version)
+            printf '%s\n' "$VERSION"
+            ;;
+
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
